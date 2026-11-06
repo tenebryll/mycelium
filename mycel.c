@@ -1,6 +1,8 @@
+#define _GNU_SOURCE /* for pipe2() */
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
 #include <pthread.h>
@@ -12,177 +14,221 @@
 #define NORMAL "\033[0m"
 #define BOLD "\033[1m"
 
-struct Commands {
-	char *label;
-	char *command;
+struct Commands
+{
+        const char *label;
+        const char *command;
+        char *output;
+        size_t length;
+        int failed;
 };
-/* Used to create commands */
-struct Commands *createCommand(char *label, char *command) {
-	struct Commands *c = malloc(sizeof(struct Commands));
-	c->label = strdup(label);
-	c->command = strdup(command);
-	return c;
+
+/* Function used for pretty error handling */
+static void error(const char *err_msg)
+{
+        fprintf(stderr, "%s%sERROR:%s%s\n", BOLD, RED, err_msg, NORMAL);
+        exit(EXIT_FAILURE);
 }
-void error(const char *err_msg) {
-	fprintf(stderr, "\033[1m%sERROR:%s\033[0m\n", RED, err_msg);
-	exit(EXIT_FAILURE);
+
+static struct Commands *createCommand(const char *label, const char *command)
+{
+        struct Commands *c = calloc(1, sizeof(struct Commands));
+        if (c == NULL)
+        {
+                error("Out of memory.");
+        }
+        c->label = label;
+        c->command = command;
+        return c;
 }
-/*Executes system commands like System() but returns output */
-int sys_cmd(const char *command, char *output) {
-	int pipefd[2];
-	pid_t pid;
-	int status;
-	if (pipe(pipefd) == -1) {
-		error("Error creating pipe.");
-	}
-	pid = fork();
-	if (pid < 0) {
-		error("Fork failed.");
-	}
-	if (pid == 0) {
-		close(pipefd[0]);
-		if (dup2(pipefd[1], STDOUT_FILENO) == -1) {
-			error("Failed to duplicate file descriptor.");
-		}
-		close(pipefd[1]);
-		if (execl("/bin/sh", "sh", "-c", command, NULL) == -1) {
-			error("Error executing command.");
-		}
-	} 
-	else {
-		close(pipefd[1]);
-		waitpid(pid, &status, 0);
-		if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-			ssize_t n = read(pipefd[0], output, 4096);
-			if (n > 0) {
-				output[n] = '\0';
-			}
-			close(pipefd[0]);
-			return 0;
-		} 
-		else {
-			close(pipefd[0]);
-			return 1;
-		}
-	}
-	return -1;
+
+/* std System() code with output stapled on */
+static int sys_cmd(struct Commands *c)
+{
+        int pipefd[2];
+        pid_t pid;
+        int status;
+        int read_failed = 0;
+        size_t capacity = 0;
+        if (pipe2(pipefd, O_CLOEXEC) == -1)
+        {
+                return 1;
+        }
+        pid = fork();
+        if (pid < 0)
+        {
+                close(pipefd[0]);
+                close(pipefd[1]);
+                return 1;
+        }
+        if (pid == 0)
+        {
+                /* async-signal-safe calls until exec */
+                int devnull = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                if (devnull == -1 || dup2(devnull, STDIN_FILENO) == -1 || dup2(pipefd[1], STDOUT_FILENO) == -1)
+                {
+                        _exit(127);
+                }
+                execl("/bin/sh", "sh", "-c", c->command, (char *)NULL);
+                _exit(127);
+        }
+        close(pipefd[1]);
+        /* Read until EOF, otherwise a commands fail to exit pipe */
+        for (;;)
+        {
+                ssize_t n;
+                if (c->length == capacity)
+                {
+                        size_t new_capacity = capacity == 0 ? 4096 : capacity * 2;
+                        char *grown = realloc(c->output, new_capacity);
+                        if (grown == NULL)
+                        {
+                                read_failed = 1;
+                                break;
+                        }
+                        c->output = grown;
+                        capacity = new_capacity;
+                }
+                n = read(pipefd[0], c->output + c->length, capacity - c->length);
+                if (n > 0)
+                {
+                        c->length += (size_t)n;
+                }
+                else if (n == 0)
+                {
+                        break;
+                }
+                else if (errno != EINTR)
+                {
+                        read_failed = 1;
+                        break;
+                }
+        }
+        close(pipefd[0]);
+        while (waitpid(pid, &status, 0) == -1)
+        {
+                if (errno != EINTR)
+                {
+                        return 1;
+                }
+        }
+        return read_failed || !WIFEXITED(status) || WEXITSTATUS(status) != 0;
 }
+
+static void *exec(void *cmd)
+{
+        struct Commands *c = cmd;
+        c->failed = sys_cmd(c);
+        return NULL;
+}
+
 /* print command output with label */
-void *exec(void *cmd) {
-	char output[4096] = {0};
-	if (sys_cmd(((struct Commands*)cmd)->command, output) == 0) {
-		printf("%s%s:\033[0m\n", GREEN, ((struct Commands*)cmd)->label);
-		printf("%s\n%s\n", output, NORMAL);
-	} 
-	else {
-		printf("%s%s:\033[0m\n", RED, ((struct Commands*)cmd)->label);
-		printf("%s\n%s\n", output, NORMAL);
-	}
-	return 0;
+static void print_result(const struct Commands *c, int color)
+{
+        const char *label_color = c->failed ? RED : GREEN;
+        const char *normal = color ? NORMAL : "";
+        printf("%s%s:%s\n", color ? label_color : "", c->label, normal);
+        if (c->length > 0)
+        {
+                fwrite(c->output, 1, c->length, stdout);
+        }
+        printf("\n%s\n", normal);
+        fflush(stdout);
 }
-int main(void){
-	struct Commands *cmds[] ={
-		/*
-			If you want to add more commands, just add more createCommand() calls.
-			[Syntax]:
-			createCommand("Label", "Command"),
-			The first argument is the label which is the text displayed above the output, the second argument is the command to be executed.
-			keep in mind since this function is within an array you add a "," instead of a ";".
-			
-   			[Output example]:
-   			createCommand("Test", "echo 'output123'"),
-   			test: <- Label
-      			output1234 <- Command output
-	 
-			[Protip]: 
-			Add 2>/dev/null to the end of the command to hide the error output.
-			This means that a command will only display output if it succeeds; 
-			thus preventing ugly error messages from being printed to the console.
-		*/
-		createCommand(
-			/*Label*/"Operating System/Kernel Info",
-			/*Command*/"uname -a ||: && (cat /etc/*-release ||: && (cat /proc/version; sleep 1 ||:)) 2>/dev/null"
-		),
-		createCommand(
-			"IDs and Groups",
-			"echo YOURID=$(id) && for i in $(cut -d':' -f1 /etc/passwd);do id $i;done; 2>/dev/null sleep 1  2>/dev/null"
-		),
-		createCommand(
-			"Env",
-			"env 2>/dev/null | grep -v 'LS_COLORS' 2>/dev/null"
-		),
-		createCommand(
-			"shells",
-			"cat /etc/shells 2>/dev/null"
-		),
-		createCommand(
-			"passwd Contents",
-			"cat /etc/passwd 2>/dev/null"
-		),
-		createCommand(
-			"master.passwd contents",
-			"cat /etc/master.passwd 2>/dev/null"
-		),
-		createCommand(
-			"group Contents",
-			"cat /etc/group 2>/dev/null"
-		),
-		createCommand(
-			"shadow Contents",
-			"cat /etc/shadow 2>/dev/null"
-		),
-		createCommand(
-			"gshadow Contents",
-			"cat /etc/gshadow 2>/dev/null"
-		),
-		createCommand(
-			"sudoers Contents",
-			"cat /etc/sudoers 2>/dev/null"
-		),
-		createCommand(
-			"profile Contents",
-			"cat /etc/profile 2>/dev/null"
-		),
-		createCommand(
-			"bashrc Contents",
-			"cat /etc/bashrc 2>/dev/null"
-		),
-		createCommand(
-			".bash_profile Contents",
-			"cat /etc/bashrc 2>/dev/null"
-		),
-		createCommand(
-			"Installed Packages (Dpkg)",
-			"dpkg --get-selections 2>/dev/null"
-		),
-		createCommand(
-			"Installed Packages (Rpm)",
-			"rpm -qa 2>/dev/null"
-		),
-		createCommand(
-			"Installed Packages (Apt)",
-			"apt list --installed 2>/dev/null"
-		),
-		createCommand(
-			"Installed Packages (Yum)",
-			"yum list installed 2>/dev/null"
-		),
-		createCommand(
-			"Installed Packages (Pacman)",
-			"pacman -Q 2>/dev/null"
-		),
-	};
-	/* Multithreading */
-	pthread_t threads[sizeof(cmds)/sizeof(cmds[0])];
-	size_t i;
-	for (i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++) {
-		char **thread = malloc(2 * sizeof(struct Commands*));
-		thread[0] = cmds[i]->label;
-		thread[1] = cmds[i]->command;
-		pthread_create(&threads[i], NULL, exec, thread);
-	}
-	for (i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
-		pthread_join(threads[i], NULL);
-	}
-	return 0;
+int main(void)
+{
+        struct Commands *cmds[] =
+        {
+                createCommand(
+                        /*Label*/"Operating System/Kernel Info",
+                        /*Command*/"(uname -a; cat /etc/*-release; cat /proc/version) 2>/dev/null"
+                ),
+                createCommand(
+                        "IDs and Groups",
+                        "echo \"YOURID=$(id)\"; for i in $(cut -d':' -f1 /etc/passwd); do id \"$i\"; done 2>/dev/null"
+                ),
+                createCommand(
+                        "Env",
+                        "env 2>/dev/null | grep -v 'LS_COLORS' 2>/dev/null"
+                ),
+                createCommand(
+                        "shells",
+                        "cat /etc/shells 2>/dev/null"
+                ),
+                createCommand(
+                        "passwd Contents",
+                        "cat /etc/passwd 2>/dev/null"
+                ),
+                createCommand(
+                        "master.passwd contents",
+                        "cat /etc/master.passwd 2>/dev/null"
+                ),
+                createCommand(
+                        "group Contents",
+                        "cat /etc/group 2>/dev/null"
+                ),
+                createCommand(
+                        "shadow Contents",
+                        "cat /etc/shadow 2>/dev/null"
+                ),
+                createCommand(
+                        "gshadow Contents",
+                        "cat /etc/gshadow 2>/dev/null"
+                ),
+                createCommand(
+                        "sudoers Contents",
+                        "cat /etc/sudoers 2>/dev/null"
+                ),
+                createCommand(
+                        "profile Contents",
+                        "cat /etc/profile 2>/dev/null"
+                ),
+                createCommand(
+                        "bashrc Contents",
+                        "cat /etc/bashrc 2>/dev/null || cat /etc/bash.bashrc 2>/dev/null"
+                ),
+                createCommand(
+                        ".bash_profile Contents",
+                        "cat ~/.bash_profile 2>/dev/null"
+                ),
+                createCommand(
+                        "Installed Packages (Dpkg)",
+                        "dpkg --get-selections 2>/dev/null"
+                ),
+                createCommand(
+                        "Installed Packages (Rpm)",
+                        "rpm -qa 2>/dev/null"
+                ),
+                createCommand(
+                        "Installed Packages (Apt)",
+                        "apt list --installed 2>/dev/null"
+                ),
+                createCommand(
+                        "Installed Packages (Yum)",
+                        "yum list installed 2>/dev/null"
+                ),
+                createCommand(
+                        "Installed Packages (Pacman)",
+                        "pacman -Q 2>/dev/null"
+                ),
+                /* Append commands below */
+        };
+
+        /* Multithreading */
+        pthread_t threads[sizeof(cmds)/sizeof(cmds[0])];
+        const int color = isatty(STDOUT_FILENO);
+        size_t i;
+        for (i = 0; i < sizeof(cmds)/sizeof(cmds[0]); i++)
+        {
+                if (pthread_create(&threads[i], NULL, exec, cmds[i]) != 0)
+                {
+                        error("Failed to create thread.");
+                }
+        }
+        for (i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++)
+        {
+                pthread_join(threads[i], NULL);
+                print_result(cmds[i], color);
+        }
+        return 0;
 }
