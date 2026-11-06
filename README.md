@@ -3,7 +3,7 @@
 [![Known Vulnerabilities](https://snyk.io/test/github/e1r2t374/mycelium/badge.svg)](https://snyk.io/test/github/e1r2t374/mycelium)
 ## [Overview]:
 
-Mycelium is an enumerator designed to provide efficient and reliable system analysis on Linux platforms. Build in the C programming language, it harnesses the power of multithreading for each command to ensure lightning-fast performace while remaining lightweight and heavily customizable.
+Mycelium is an enumerator designed to provide efficient and reliable system analysis on Linux platforms. Build in the C programming language, it harnesses the power of multi-threading for each command to ensure lightning-fast performance while remaining lightweight and heavily customizable.
 
 ## [License]:
 
@@ -11,10 +11,10 @@ This project is licensed under the GNU GENERAL PUBLIC LICENSE Version 3.
 
 ## [Key Features]:
 
-- **Multithreading:** Utilizing multithreading capabilities for fast and concurrent system enumeration and analysis.
-- **Customizable:** Tailor the enumerator to suit your specific needs and preferances.
+- **Multi-threading:** Utilizing multi-threading capabilities for fast and concurrent system enumeration and analysis.
+- **Customizable:** Tailor the enumerator to suit your specific needs and preferences.
 - **Minimal Design Philosophy:** Emphasizing simplicity, efficiency, and minimalism for a streamlined user experience.
-- **Linux Compatibility:** Compatible with various linux distributions for seamless integration into your environment.
+- **Linux Compatibility:** Compatible with various Linux distributions for seamless integration into your environment.
 
 ## [Usage]:
 ### Command for compiling the program: 
